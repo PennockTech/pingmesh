@@ -19,6 +19,7 @@ import (
 
 	"flag"
 	"fmt"
+	"io/ioutil"
 	"log"
 	"os"
 	"os/signal"
@@ -121,6 +122,15 @@ func main() {
 	hostEnv := os.Getenv("PINGMESH_HOSTNAME")
 	if len(myHost) == 0 {
 		myHost = hostEnv // if also be empty no DNS lookup is done
+	}
+	if len(myHost) == 0 {
+		const kubernetesHackIP = "/etc/public-ip/ip"
+		if _, err := os.Stat(kubernetesHackIP); err == nil {
+			b, err := ioutil.ReadFile(kubernetesHackIP)
+			if err == nil && len(b) > 0 {
+				myHost = string(b)
+			}
+		}
 	}
 
 	wasFlagPassed := func(fn string) bool {
