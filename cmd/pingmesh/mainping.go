@@ -128,7 +128,7 @@ func main() {
 		if _, err := os.Stat(kubernetesHackIP); err == nil {
 			b, err := ioutil.ReadFile(kubernetesHackIP)
 			if err == nil && len(b) > 0 {
-				myHost = string(b)
+				myHost = strings.TrimSpace(string(b))
 			}
 		}
 	}
