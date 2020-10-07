@@ -4,8 +4,7 @@
 ##
 FROM alpine:3.12
 
-RUN apk update && apk add ca-certificates && /bin/rm -rf /var/cache/apk/*
-RUN apk add --no-cache curl
+RUN apk update && apk add --no-cache ca-certificates curl jq && /bin/rm -rf /var/cache/apk/*
 
 ADD cmd/pingmesh/pingmesh.exe /usr/local/bin/pingmesh
 
