@@ -15,6 +15,8 @@ import (
 
 	"github.com/getsentry/sentry-go"
 
+	"github.com/nats-io/nats.go"
+
 	"flag"
 	"fmt"
 	"log"
@@ -22,6 +24,7 @@ import (
 	"os/signal"
 	"strconv"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
 )
@@ -35,6 +38,9 @@ You can interrupt it with ^C (SIGINT) or SIGTERM.
 
 Command line flags:
 `
+
+const natsBroadcastInterval = 20 * time.Second
+const natsPersistDuration = 300 * time.Second
 
 func printUsage() {
 	fmt.Fprintf(os.Stderr, usage, os.Args[0])
@@ -50,17 +56,20 @@ func main() {
 	////
 	//  flags
 	var (
-		numTests    int
-		pingDelay   int
-		maxFail     int
-		servePort   int
-		serveReport int
-		myLocation  string
-		myHost      string
-		peerIP      string
-		cwFlag      bool
-		vf, v2, qf  bool
-		verbose     int = 1
+		numTests            int
+		pingDelay           int
+		maxFail             int
+		servePort           int
+		serveReport         int
+		myLocation          string
+		myHost              string
+		peerIP              string
+		natsServer          string
+		natsSubject         string
+		natsCredentialsPath string
+		cwFlag              bool
+		vf, v2, qf          bool
+		verbose             int = 1
 	)
 
 	flag.IntVar(&pingDelay, "d", 10, "delay in seconds between ping requests")
@@ -75,6 +84,9 @@ func main() {
 	flag.StringVar(&myLocation, "L", "", "HTTP client's location to report")
 	flag.StringVar(&myHost, "H", "", "My hostname (should resolve to accessible IPs)")
 	flag.StringVar(&peerIP, "I", "", "remote peer IP address override")
+	flag.StringVar(&natsServer, "N", "", "NATS server to connect to for peer discovery (comma-separated list of URLs)")
+	flag.StringVar(&natsSubject, "S", "pingmesh.discover", "NATS subject to announce and listen on")
+	flag.StringVar(&natsCredentialsPath, "C", "", "NATS credentials path (JWT+nkey)")
 
 	flag.Usage = printUsage
 	flag.Parse()
@@ -216,6 +228,18 @@ func main() {
 		}
 	}
 
+	if natsServer != "" {
+		natsOpts := []nats.Option{nats.Name("pingmesh diagnostic tool")}
+		if natsCredentialsPath != "" {
+			natsOpts = append(natsOpts, nats.UserCredentials(natsCredentialsPath))
+		}
+		nc, err := nats.Connect(natsServer, natsOpts...)
+		if err != nil {
+			log.Fatalf("NATS server connection to %q failed: %v", natsServer, err)
+		}
+		handleNATSSetup(nc, natsSubject, myHost, servePort, myLocation)
+	}
+
 	////
 	// Start a Pinger for each endpoint on the command line
 	for _, url := range endpoints {
@@ -235,4 +259,102 @@ func main() {
 	client.LogSentry(sentry.LevelInfo, "%s:%d server shutdown, exiting %s", myHost, servePort, myLocation)
 	sentry.Flush(time.Second * 5)
 	return
+}
+
+func handleNATSSetup(nc *nats.Conn, natsSubject string, myHost string, servePort int, myLocation string) {
+	// *server.meshSrv is not exported so we can't take pm as a parameter.
+	// But it's a singleton and we can get the current value with server.PingmeshServer()
+	// Do so where needed.
+
+	if servePort != 0 {
+		go broadcastSelfOnNATS(nc, natsSubject, myHost, servePort, myLocation)
+	}
+
+	nc.Subscribe(natsSubject, func(msg *nats.Msg) {
+		// SCHEMA: string, one-line, contains a URL
+		// SEMANTICS: add the URL as something we should peer with for some duration, auto-remove if not refreshed
+		url := strings.TrimSpace(string(msg.Data))
+		registerTemporaryPeer(url)
+	})
+
+	go cleanupExpiredPeers()
+}
+
+func broadcastSelfOnNATS(nc *nats.Conn, natsSubject string, myHost string, servePort int, myLocation string) {
+	url := fmt.Sprintf("http://%s:%d/v1/ping#%s", myHost, servePort, myLocation)
+	msgBody := []byte(url)
+	// FIXME: Ideally we'd use a jitter ticker here
+	ticker := time.NewTicker(natsBroadcastInterval)
+	for {
+		nc.Publish(natsSubject, msgBody)
+		_ = <-ticker.C
+	}
+}
+
+var temporaryPeers sync.Map
+
+func registerTemporaryPeer(url string) {
+	isNew := false
+	if _, ok := temporaryPeers.Load(url); !ok {
+		isNew = true
+	}
+	temporaryPeers.Store(url, time.Now())
+
+	if !isNew {
+		return
+	}
+
+	location := client.LocUnknown
+	parts := strings.Split(url, "#")
+	if len(parts) > 1 {
+		location = parts[1]
+		url = parts[0]
+	}
+
+	pm := server.PingmeshServer()
+	pm.AddPingTarget(url, "", location)
+}
+
+func cleanupExpiredPeers() {
+	// This logic doesn't actually remove after natsPersistDuration;
+	// every nPD, if we haven't seen it within that time-period, we delete it.
+	// So the upper limit is "just less than 2x nPD".  That's good enough.
+	// I don't think precision is needed here.
+	ticker := time.NewTicker(natsPersistDuration)
+	previousTime := time.Now()
+	for {
+		nextTime := <-ticker.C
+
+		toDelete := make([]string, 0, 50)
+		temporaryPeers.Range(func(k, v interface{}) bool {
+			t := v.(time.Time)
+			if t.After(previousTime) {
+				return true
+			}
+			temporaryPeers.Delete(k)
+			toDelete = append(toDelete, k.(string))
+			return true
+		})
+
+		go unregisterExpired(toDelete)
+		previousTime = nextTime
+	}
+}
+
+func unregisterExpired(urls []string) {
+	pm := server.PingmeshServer()
+
+	for _, url := range urls {
+		if _, ok := temporaryPeers.Load(url); ok {
+			// it has reappeared, don't nuke it
+			continue
+		}
+		// race here, but so very unlikely: must've been gone for more than 5 mins,
+		// but now come back in this window
+		// Also, thanks to unexported types, we have to create a new peer, just
+		// to delete it and anything matching it, so there should be two
+		// deletions for each peer: our newly created temp, and the real one.
+		peer := pm.NewPeer(url, "", "")
+		pm.Delete(peer)
+	}
 }
