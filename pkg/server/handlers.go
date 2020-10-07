@@ -42,7 +42,6 @@ func (s *meshSrv) SetupRoutes() {
 		{"/v1/env", "", s.envHandler},
 		{"/v1/ping", "get a ping response", s.PingHandler},
 		{"/v1/peers", "get a list of peers", s.PeersHandler},
-		{"/v1/addpeer", "add a ping peer (takes ip, port, hostname)", s.AddPingHandler},
 		{"/v1/metrics", "get memory statistics", s.MetricsHandler},
 		{"/v1/quit", "shut down this pinger", s.QuitHandler},
 	}
